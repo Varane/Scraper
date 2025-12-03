@@ -71,6 +71,12 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
 ]
 
+EBAY_BASE_URLS = [
+    "https://www.ebay.com",
+    "https://www.ebay.de",
+    "https://www.ebay.co.uk",
+]
+
 CATALOG_PATH = Path("catalog.json")
 LOG_PATH = Path("log.txt")
 
@@ -79,20 +85,6 @@ LOG_PATH = Path("log.txt")
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def ensure_files_exist() -> None:
-    if not CATALOG_PATH.exists():
-        try:
-            CATALOG_PATH.write_text("{}", encoding="utf-8")
-        except Exception:
-            pass
-    if not LOG_PATH.exists():
-        try:
-            LOG_PATH.touch()
-        except Exception:
-            pass
-    log_info("--- RUN STARTED ---")
 
 
 def log_info(message: str) -> None:
@@ -113,13 +105,29 @@ def log_error(message: str) -> None:
 
 def log_oems(brand: str, model: str, part: str, oems: List[str]) -> None:
     joined = ",".join(oems)
-    log_info(f"OEM brand={brand} model={model} part={part} oems={joined}.")
+    log_info(f"OEM brand={brand} model={model} part={part} oems={joined}")
 
 
-# Catalog helpers
+# File helpers
+
+def ensure_files_exist() -> None:
+    if not CATALOG_PATH.exists():
+        try:
+            CATALOG_PATH.write_text("{}", encoding="utf-8")
+        except Exception as exc:
+            log_error(f"Failed to initialize catalog file: {exc!r}")
+    if not LOG_PATH.exists():
+        try:
+            LOG_PATH.touch()
+        except Exception:
+            pass
+    log_info("--- RUN STARTED ---")
+
 
 def load_catalog() -> Dict:
     try:
+        if not CATALOG_PATH.exists():
+            return {}
         with CATALOG_PATH.open("r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception as exc:
@@ -129,10 +137,12 @@ def load_catalog() -> Dict:
 
 def save_catalog(catalog: Dict) -> None:
     try:
+        log_info("Saving catalog...")
         temp_path = CATALOG_PATH.with_suffix(".tmp")
         with temp_path.open("w", encoding="utf-8") as fh:
             json.dump(catalog, fh, indent=2, ensure_ascii=False)
         temp_path.replace(CATALOG_PATH)
+        log_info("Catalog saved successfully.")
     except Exception as exc:
         log_error(f"Failed to save catalog: {exc!r}")
 
@@ -152,24 +162,29 @@ def existing_oems_for_part(catalog: Dict, brand: str, model: str, part: str) -> 
 # Scraping helpers
 
 def random_headers() -> Dict[str, str]:
-    return {"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "en-US,en;q=0.9"}
-
-
-def polite_sleep() -> None:
-    time.sleep(random.uniform(1.0, 3.0))
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
 
 def request_with_retry(url: str, session: requests.Session, proxy: Optional[str]) -> Optional[str]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    for attempt in range(5):
-        polite_sleep()
+    for attempt in range(1, 6):
+        sleep_seconds = random.uniform(1.0, 3.0) * attempt
+        log_info(f"Sleeping for {sleep_seconds:.2f}s before request attempt {attempt} URL={url}")
+        time.sleep(sleep_seconds)
         try:
+            log_info(f"Requesting URL={url}, attempt={attempt}")
             response = session.get(url, headers=random_headers(), proxies=proxies, timeout=20)
-            if response.status_code == 200:
+            status = response.status_code
+            if status == 200:
+                log_info(f"Request success status=200 URL={url}")
                 return response.text
-            log_error(f"Non-200 status {response.status_code} for {url}")
+            log_error(f"Non-200 status {status} for URL={url}")
         except requests.RequestException as exc:
-            log_error(f"Request failed (attempt {attempt + 1}) for {url}: {exc!r}")
+            log_error(f"Request failed (attempt {attempt}) for URL={url}: {exc!r}")
+    log_error(f"Giving up on URL={url} after 5 attempts")
     return None
 
 
@@ -192,18 +207,32 @@ def parse_price(price_text: str) -> Optional[Dict[str, float]]:
     return {"currency": currency, "price": amount}
 
 
-def extract_listings(query: str, session: requests.Session, proxy: Optional[str], existing_oems: Set[str], brand: str, model: str, part: str) -> List[Dict[str, object]]:
+def extract_listings(
+    query: str,
+    session: requests.Session,
+    proxy: Optional[str],
+    existing_oems: Set[str],
+    brand: str,
+    model: str,
+    part: str,
+    base_url: str,
+) -> List[Dict[str, object]]:
+    log_info(f"Extracting listings for query='{query}'")
     encoded_query = quote_plus(query)
-    url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}"
+    url = f"{base_url}/sch/i.html?_nkw={encoded_query}"
     html = request_with_retry(url, session, proxy)
     if not html:
+        log_error(f"No HTML returned for query='{query}'")
         return []
 
     soup = BeautifulSoup(html, "lxml")
     listings: List[Dict[str, object]] = []
     seen_oems = set(existing_oems)
 
-    for item in soup.select("li.s-item"):
+    items = soup.select("li.s-item")
+    log_info(f"Found {len(items)} raw items for query='{query}'")
+
+    for item in items:
         if len(listings) >= 10:
             break
         try:
@@ -223,19 +252,18 @@ def extract_listings(query: str, session: requests.Session, proxy: Optional[str]
             if not oems:
                 continue
             frequencies = Counter(oems)
-            primary = frequencies.most_common(1)[0][0]
-            primary_upper = primary.upper()
-            if primary_upper in seen_oems:
+            primary = frequencies.most_common(1)[0][0].upper()
+            if primary in seen_oems:
                 continue
-            cross_refs = sorted({oem for oem in oems if oem.upper() != primary_upper})
+            cross_refs = sorted({oem.upper() for oem in oems if oem.upper() != primary})
             image_tag = item.select_one(".s-item__image-img")
             image_url = ""
             if image_tag:
                 image_url = image_tag.get("src") or image_tag.get("data-src") or ""
 
             listing = {
-                "oem_main": primary_upper,
-                "oem_cross_refs": [c.upper() for c in cross_refs],
+                "oem_main": primary,
+                "oem_cross_refs": cross_refs,
                 "title": title_tag.get_text(strip=True),
                 "price": price_info["price"],
                 "currency": price_info["currency"],
@@ -243,13 +271,18 @@ def extract_listings(query: str, session: requests.Session, proxy: Optional[str]
                 "ebay_url": link_tag.get("href", ""),
             }
             listings.append(listing)
-            seen_oems.add(primary_upper)
-            log_oems(brand, model, part, [primary_upper] + [c.upper() for c in cross_refs])
+            seen_oems.add(primary)
+            seen_oems.update(cross_refs)
+            log_oems(brand, model, part, [primary] + cross_refs)
         except Exception as exc:  # pragma: no cover - defensive logging
-            log_error(f"Failed to parse listing for query '{query}': {exc!r}")
+            log_error(f"Failed to parse listing for query='{query}': {exc!r}")
             continue
+
+    log_info(f"Extracted {len(listings)} listings for query='{query}'")
     return listings
 
+
+# Catalog building
 
 def ensure_brand_model_part(catalog: Dict, brand: str, model: str, part: str) -> None:
     catalog.setdefault(brand, {}).setdefault(model, {}).setdefault(part, [])
@@ -258,15 +291,20 @@ def ensure_brand_model_part(catalog: Dict, brand: str, model: str, part: str) ->
 def build_catalog(proxy: Optional[str] = None) -> Dict:
     session = requests.Session()
     catalog = load_catalog()
+    domain_index = 0
 
     for brand, models in BRAND_MODELS.items():
-        log_info(f"Processing brand {brand}")
+        log_info(f"Starting brand={brand}")
         for model in models:
+            log_info(f"Starting model={brand} {model}")
             for part in PARTS:
+                log_info(f"Starting part={brand} {model} {part}")
                 try:
                     existing_entries = catalog.get(brand, {}).get(model, {}).get(part, [])
                     if existing_entries:
+                        log_info(f"Skipping part={brand} {model} {part} (already in catalog)")
                         continue
+
                     existing_oems = existing_oems_for_part(catalog, brand, model, part)
                     part_results: List[Dict[str, object]] = []
                     queries = [
@@ -275,18 +313,49 @@ def build_catalog(proxy: Optional[str] = None) -> Dict:
                         f"{brand} {model} {part} replacement",
                     ]
                     for query in queries:
-                        dedupe_set = existing_oems | {entry["oem_main"].upper() for entry in part_results if isinstance(entry.get("oem_main"), str)}
-                        dedupe_set.update({ref.upper() for entry in part_results for ref in entry.get("oem_cross_refs", []) if isinstance(ref, str)})
-                        listings = extract_listings(query, session, proxy, dedupe_set, brand, model, part)
+                        log_info(f"Building query='{query}'")
+                        base_url = EBAY_BASE_URLS[domain_index % len(EBAY_BASE_URLS)]
+                        domain_index += 1
+                        dedupe_set = set(existing_oems)
+                        for entry in part_results:
+                            main_val = entry.get("oem_main")
+                            if isinstance(main_val, str):
+                                dedupe_set.add(main_val.upper())
+                            for ref in entry.get("oem_cross_refs", []):
+                                if isinstance(ref, str):
+                                    dedupe_set.add(ref.upper())
+                        listings = extract_listings(
+                            query,
+                            session,
+                            proxy,
+                            dedupe_set,
+                            brand,
+                            model,
+                            part,
+                            base_url,
+                        )
                         part_results.extend(listings)
+
                     if part_results:
                         ensure_brand_model_part(catalog, brand, model, part)
                         catalog[brand][model][part] = part_results
+                        log_info(
+                            f"Saving {len(part_results)} listings for brand={brand} model={model} part={part}"
+                        )
                         save_catalog(catalog)
+                    else:
+                        log_info(f"No results for brand={brand} model={model} part={part}")
                 except Exception as exc:
                     log_error(f"Error while processing brand={brand} model={model} part={part}: {exc!r}")
                     save_catalog(catalog)
-                    continue
+                finally:
+                    log_info(
+                        f"Finished part={brand} {model} {part}, {len(catalog.get(brand, {}).get(model, {}).get(part, []))} listings saved"
+                    )
+            log_info(f"Finished model={brand} {model}")
+        log_info(f"Finished brand={brand}")
+
+    log_info("Finished full brand/model/part iteration")
     save_catalog(catalog)
     return catalog
 
@@ -311,6 +380,7 @@ def main() -> None:
         if catalog is None:
             catalog = load_catalog()
         save_catalog(catalog)
+        log_info("--- RUN FINISHED ---")
 
 
 if __name__ == "__main__":
